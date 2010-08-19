@@ -1,0 +1,180 @@
+=begin
+使い方
+class TxMoveUserPoint < BaseTx
+  def src_phase(src, args)
+    src[:point] -= args[:amount]
+  end
+  def dest_phase(dest, args)
+    dest[:point] += args[:amount]
+  end
+end
+
+u1 = User.create(:point=>1000)                                   
+=> #<User @sid=21 @name=nil @message=nil @point=1000 @created_at=Thu, 17 Dec 2009 21:14:29 +0900 @updated_at=Thu, 17 Dec 2009 21:14:29 +0900>
+
+u2 = User.create(:point=>1000)                                   
+=> #<User @sid=22 @name=nil @message=nil @point=1000 @created_at=Thu, 17 Dec 2009 21:14:33 +0900 @updated_at=Thu, 17 Dec 2009 21:14:33 +0900>
+
+TxMoveUserPoint.exec(u1.__entity__, u2.__entity__, :amount=>200)  
+=> true
+
+u1.reload
+=> #<User @sid=21 @name=nil @message=nil @point=800 @created_at=Thu, 17 Dec 2009 21:14:29 +0900 @updated_at=Thu, 17 Dec 2009 21:14:29 +0900>
+
+u2.reload
+=> #<User @sid=22 @name=nil @message=nil @point=1200 @created_at=Thu, 17 Dec 2009 21:14:33 +0900 @updated_at=Thu, 17 Dec 2009 21:14:33 +0900>
+
+TxMoveUserPoint.roll_forward_all
+=end
+# memo デプロイ時に未完了のトランザクションがあってトランザクション定義がかわったら？version???
+
+class BaseTx
+  LowDS = TinyDS::LowDS
+
+  def src_phase(src, args)
+    raise "no impl."
+  end
+  def dest_phase(dest, args)
+    raise "no impl."
+  end
+  def self.tx_kind
+    name
+  end
+  def roll_forward_retries_limit
+    100
+  end
+  attr_reader :tx_key
+
+  # トランザクション実行
+  #          :  src_phase   dest_phase
+  #   raised :    failed      ----
+  #   false  :    OK          failed
+  #   true   :    OK          OK
+  def self.exec(src, dest, args={})
+    tx = new
+    tx.create_tx(src, dest, args)
+    begin
+      tx.roll_forward
+    rescue AppEngine::Datastore::TransactionFailed => e
+      return false
+    end
+    return true
+  end
+
+  def self.roll_forward_all(limit=50)
+    pending_tx_query.each(:limit=>limit) do |tx_ent|
+      tx = new
+      tx.restore_tx(tx_ent)
+      begin
+        tx.roll_forward
+      rescue => e
+        # logger.warn("roll_forward failed. tx=[#{tx.tx_key}] e=[#{e.inspect}]")
+      end
+    end
+    nil
+  end
+
+  def self.pending_tx_query(status="pending", dire=:asc) # pending/done/failed
+    direction = dire==:desc ? AppEngine::Datastore::Query::DESCENDING : AppEngine::Datastore::Query::ASCENDING
+    AppEngine::Datastore::Query.new("TxSrc").
+      filter(:tx_kind, AppEngine::Datastore::Query::EQUAL, tx_kind).
+      filter(:status,  AppEngine::Datastore::Query::EQUAL, status).
+      sort(:created_at, direction)
+  end
+
+  # doneなTxSrcと対応するTxDoneを削除する
+#  def self.delete_done_tx
+#  end
+
+  require "benchmark"
+  def create_tx(src, dest, args)
+    #RAILS_DEFAULT_LOGGER.info ["create_tx", Benchmark.measure{
+      _create_tx(src, dest, args)
+    #}].inspect
+  end
+  def roll_forward
+    #RAILS_DEFAULT_LOGGER.info ["roll_forward", Benchmark.measure{
+      _roll_forward
+    #}].inspect
+  end
+
+  # トランザクション前半
+  #   TODO TxIDを指定できるようにする。TxSrc#key.nameにTxIDを指定して重複実行防止
+  def _create_tx(src, dest, args)
+    tx_ent = nil
+    ds_transaction{
+      src = src.class.get(src.key)
+      src_phase(src, args)
+      src.save
+
+      attrs = {
+        :tx_kind                   => self.class.tx_kind,
+        :dest_key                  => dest.key.to_s,
+        :status                    => "pending",
+        :roll_forward_failed_count => 0,
+        :args                      => args.to_yaml,
+        :created_at                => Time.now
+      }
+      tx_ent = LowDS.create("TxSrc", attrs, :parent=>src.entity) # srcがparent, tx_entがchild
+      # COMMIT:「srcの処理(=src_phase)、TxSrc作成」
+    }
+    @tx_key = tx_ent.key.to_s
+    nil
+  end
+
+  def restore_tx(tx_ent)
+    @tx_key = tx_ent.key.to_s
+    nil
+  end
+
+  # トランザクション後半
+  def _roll_forward
+    tx_ent = LowDS.get(@tx_key, :kind=>"TxSrc")
+
+    ds_transaction{
+      dest_key = LowDS::KeyFactory.stringToKey(tx_ent[:dest_key])
+      dest = dest_key.kind.constantize.get(dest_key)
+      done_name = "TxDone_#{@tx_key}"
+      done_key = LowDS::KeyFactory.createKey(dest.key, "TxDone", done_name)
+      begin
+        LowDS.get(done_key, "TxDone")
+        # なにもしない : TxDoneが存在しているということはdest_phaseは処理済み
+      rescue AppEngine::Datastore::EntityNotFound => e
+        # TxDoneが無い→dest_phaseが未実行
+        attrs = {:done_at=>Time.now}
+        done_ent = LowDS.create("TxDone", attrs, :parent=>dest.entity, :name=>done_name)
+        dest_phase(dest, YAML.load(tx_ent[:args])) # destの処理を実行
+        dest.save
+      end
+      # memo: done_keyが同じTxDoneをcommitしようとするとTransactionFailedになるはず→dest_phaseもキャンセル
+      # COMMIT:「destの処理(=dest_phase)、TxDone作成」
+    }
+
+    # TxSrc#statusをdoneに
+    ds_transaction{
+      tx_ent = LowDS.get(@tx_key, :kind=>"TxSrc")
+      if tx_ent[:status]=="pending"
+        tx_ent[:status] = "done"
+        tx_ent[:done_at] = Time.now
+        LowDS.save(tx_ent)
+      end
+    }
+    return true
+  rescue
+    ds_transaction{
+      tx_ent = LowDS.get(@tx_key, :kind=>"TxSrc")
+      tx_ent[:roll_forward_failed_count] += 1
+      if roll_forward_retries_limit < tx_ent[:roll_forward_failed_count]
+        tx_ent[:status] = "failed"
+      end
+      LowDS.save(tx_ent)
+    }
+    return false
+  end
+
+  # EntityGroup単位のtransaction
+  def ds_transaction(&block)
+    retries = 3
+    AppEngine::Datastore.transaction(retries, &block)
+  end
+end

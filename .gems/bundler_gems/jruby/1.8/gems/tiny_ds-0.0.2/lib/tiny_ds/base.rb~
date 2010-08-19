@@ -1,0 +1,115 @@
+=begin
+  special pname
+    - key
+    - parent
+    - id
+    - name
+=end
+
+
+class ModelBase
+  @@properties = {}
+  def self.property(pname, ptype, opts={})
+    pname = pname.to_sym
+    if @@properties[pname]
+      raise "duplicated pname=#{pname}"
+    end
+    @@properties[pname] = Property.new(pname, ptype, opts)
+  end
+
+  # kind-string of entity
+  def self.kind
+    name
+  end
+
+  def self.tx(retries=0, &block)
+    transaction{
+      yield(block)
+    }
+  end
+
+  # Foo.create(attrs
+  def self.create(attrs={})
+    m = new(attrs)
+    m.save
+    m
+  end
+
+  # Foo.new
+  def initialize(attrs={})
+    attributes = attrs
+  end
+
+  def self.new_from_entity(entity)
+    m = new()
+  end
+
+  # foo.save
+  def save
+    _save
+  end
+
+  def _save
+  end
+
+  # Foo.get(key)
+  def self.get(key)
+    if key.kind_of?(String)
+      key = LowDS::KeyFactory.stringToKey(key)
+    end
+    raise "invalid key=#{key}" unless key.kind_of?(AppEngine::Datastore::Key)
+    self.new_from_entity(LowDS.get(key, :kind=>self.kind))
+  end
+
+  def self.find(*args)
+    
+  end
+
+  # foo.destroy
+  def destroy
+  end
+
+  def attributes=(attrs)
+    # TODO key, parent, id, name
+    
+    attrs.each do |k,v|
+      prop = @@properties[k.to_sym]
+      prop.value = v
+    end
+    nil
+  end
+
+  def method_missing(m, *args)
+    prop, is_set = if m =~ /(.+)=$/
+                     [@@properties[$1.to_sym], true]
+                   else
+                     [@@properties[m.to_sym], false]
+                   end
+    if prop
+      # TODO define method.
+      if is_set
+        raise if args.size!=1
+        prop.value = args.first
+      else
+        raise if args.size!=0
+        prop.value
+      end
+    else
+      super(m, *args)
+    end
+  end
+
+  class Property
+    def initialize(pname, ptype, opts)
+      @pname = pname
+      @ptype = ptype
+      @opts  = opts
+    end
+    def value=(v)
+      # check_type or cast
+      @value = v
+    end
+    attr_reader :value
+  end
+end
+
